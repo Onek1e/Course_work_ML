@@ -1,0 +1,830 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+import cv2
+from torchvision import transforms
+import math
+from collections import deque
+import random
+import time
+
+class RobotVisionSystem(nn.Module):
+    def __init__(self, input_channels=3, hidden_size=256, latent_dim=128):
+        super(RobotVisionSystem, self).__init__()
+        
+        # CNN энкодер для обработки изображений
+        self.cnn_encoder = nn.Sequential(
+            nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            
+            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+        
+        # LSTM для обработки временных последовательностей
+        self.lstm = nn.LSTM(
+            input_size=512,
+            hidden_size=hidden_size,
+            num_layers=3,
+            batch_first=True,
+            dropout=0.3
+        )
+        
+        # Вариационный автоэнкодер
+        self.fc_mu = nn.Linear(hidden_size, latent_dim)
+        self.fc_var = nn.Linear(hidden_size, latent_dim)
+        
+        # Декодер для реконструкции состояния
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU()
+        )
+        
+        # Сеть актора для генерации действий
+        self.actor_net = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 7)  # 6 суставов + захват
+        )
+        
+        # Сеть критика для оценки действий
+        self.critic_net = nn.Sequential(
+            nn.Linear(latent_dim + 7, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+        
+        # Нормализация входных данных
+        self.input_norm = nn.BatchNorm2d(input_channels)
+        
+        # Параметры обучения
+        self.latent_dim = latent_dim
+        self.hidden_size = hidden_size
+        
+    def reparameterize(self, mu, log_var):
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+        
+    def encode_vision(self, x):
+        x = self.input_norm(x)
+        features = self.cnn_encoder(x)
+        return features.view(features.size(0), -1)
+        
+    def process_sequence(self, features, hidden=None):
+        lstm_out, hidden = self.lstm(features, hidden)
+        return lstm_out, hidden
+        
+    def encode_state(self, lstm_out):
+        mu = self.fc_mu(lstm_out[:, -1, :])
+        log_var = self.fc_var(lstm_out[:, -1, :])
+        z = self.reparameterize(mu, log_var)
+        return z, mu, log_var
+class RobotVisionSystem(nn.Module): # продолжение класса
+    def forward(self, x, hidden=None):
+        # Обработка визуальных данных
+        visual_features = self.encode_vision(x)
+        batch_size = visual_features.size(0)
+        
+        # Преобразование для LSTM
+        features_seq = visual_features.unsqueeze(1).expand(-1, 5, -1)  # Используем последние 5 кадров
+        
+        # LSTM обработка
+        lstm_out, hidden = self.process_sequence(features_seq, hidden)
+        
+        # Получение латентного представления
+        z, mu, log_var = self.encode_state(lstm_out)
+        
+        # Реконструкция состояния
+        reconstructed = self.decoder(z)
+        
+        # Генерация действий
+        actions = self.actor_net(z)
+        actions_scaled = torch.tanh(actions)  # Масштабирование действий
+        
+        # Оценка действий критиком
+        state_action = torch.cat([z, actions_scaled], dim=1)
+        value = self.critic_net(state_action)
+        
+        return actions_scaled, value, reconstructed, mu, log_var, hidden
+
+class RobotControlSystem:
+    def __init__(self, model_path=None):
+        self.device = torch.device("cpu")
+        self.vision_system = RobotVisionSystem().to(self.device)
+        
+        if model_path:
+            self.vision_system.load_state_dict(torch.load(model_path, map_location=self.device))
+        
+        self.optimizer = torch.optim.Adam(self.vision_system.parameters(), lr=0.001)
+        self.experience_buffer = deque(maxlen=10000)
+        self.batch_size = 64
+        
+        # Параметры обучения
+        self.gamma = 0.99  # Коэффициент дисконтирования
+        self.tau = 0.005   # Коэффициент мягкого обновления
+        self.alpha = 0.2   # Температурный параметр для SAC
+        
+        # Трансформации для изображений
+        self.transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                              std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Инициализация целевой сети
+        self.target_vision_system = RobotVisionSystem().to(self.device)
+        self.target_vision_system.load_state_dict(self.vision_system.state_dict())
+        
+    def preprocess_image(self, image):
+        """Предобработка изображения"""
+        if isinstance(image, np.ndarray):
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        return self.transform(image).unsqueeze(0)
+        
+    def compute_loss(self, batch):
+        states, actions, rewards, next_states, dones = batch
+        
+        # VAE потери
+        _, _, reconstructed, mu, log_var, _ = self.vision_system(states)
+        reconstruction_loss = F.mse_loss(reconstructed, states.view(states.size(0), -1))
+        kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+        
+        # Потери актора
+        current_actions, current_value, _, _, _, _ = self.vision_system(states)
+        actor_loss = -current_value.mean()
+        
+        # Потери критика
+        with torch.no_grad():
+            next_actions, next_value, _, _, _, _ = self.target_vision_system(next_states)
+            target_q = rewards + self.gamma * (1 - dones) * next_value
+            
+        critic_loss = F.mse_loss(current_value, target_q)
+        
+        # Общая функция потерь
+        total_loss = reconstruction_loss + 0.1 * kl_loss + actor_loss + critic_loss
+        
+        return total_loss, {
+            'reconstruction': reconstruction_loss.item(),
+            'kl': kl_loss.item(),
+            'actor': actor_loss.item(),
+            'critic': critic_loss.item()
+        }
+        
+    def update_target_network(self):
+        """Мягкое обновление целевой сети"""
+        for target_param, param in zip(self.target_vision_system.parameters(),
+                                     self.vision_system.parameters()):
+            target_param.data.copy_(
+                target_param.data * (1.0 - self.tau) + param.data * self.tau
+            )
+            
+    def train_step(self):
+        """Один шаг обучения"""
+        if len(self.experience_buffer) < self.batch_size:
+            return None
+            
+        # Выборка батча
+        batch = random.sample(self.experience_buffer, self.batch_size)
+        batch = [torch.cat([item[i] for item in batch]).to(self.device) 
+                for i in range(5)]  # states, actions, rewards, next_states, dones
+        
+        # Вычисление потерь и обновление весов
+        self.optimizer.zero_grad()
+        loss, metrics = self.compute_loss(batch)
+        loss.backward()
+        self.optimizer.step()
+        
+        # Обновление целевой сети
+        self.update_target_network()
+        
+        return metrics
+class VisionProcessor:
+    def __init__(self):
+        self.object_detector = ObjectDetector()
+        self.pose_estimator = PoseEstimator()
+        self.trajectory_tracker = TrajectoryTracker()
+        
+        # Параметры обработки изображений
+        self.frame_buffer = deque(maxlen=5)
+        self.detection_threshold = 0.7
+        self.min_object_size = 100
+        
+    def process_frame(self, frame):
+        # Предобработка кадра
+        processed_frame = self._preprocess_frame(frame)
+        self.frame_buffer.append(processed_frame)
+        
+        # Обнаружение объектов
+        detections = self.object_detector.detect(processed_frame)
+        
+        # Оценка позы объектов
+        poses = self.pose_estimator.estimate(processed_frame, detections)
+        
+        # Отслеживание траекторий
+        trajectories = self.trajectory_tracker.update(poses)
+        
+        return detections, poses, trajectories
+        
+    def _preprocess_frame(self, frame):
+        """Предобработка входного кадра"""
+        # Изменение размера
+        frame = cv2.resize(frame, (640, 480))
+        
+        # Нормализация
+        frame = frame.astype(np.float32) / 255.0
+        
+        # Улучшение контраста
+        frame = self._enhance_contrast(frame)
+        
+        return frame
+        
+    def _enhance_contrast(self, image):
+        """Улучшение контраста изображения"""
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        
+        # CLAHE для L-канала
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        l = clahe.apply(l)
+        
+        # Объединение каналов
+        lab = cv2.merge((l,a,b))
+        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        
+        return enhanced
+
+
+class ObjectDetector:
+    def __init__(self):
+        # U-Net для сегментации
+        self.segmentation_model = UNet(
+            in_channels=3,
+            out_channels=1,
+            init_features=32
+        )
+        
+    def detect(self, frame):
+        # Сегментация объектов
+        mask = self._segment_objects(frame)
+        
+        # Поиск контуров
+        contours = self._find_contours(mask)
+        
+        # Анализ контуров
+        objects = self._analyze_contours(contours, frame.shape)
+        
+        return objects
+        
+    def _segment_objects(self, frame):
+        """Сегментация объектов с помощью U-Net"""
+        with torch.no_grad():
+            input_tensor = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0)
+            mask = self.segmentation_model(input_tensor)
+            mask = torch.sigmoid(mask) > 0.5
+            mask = mask.squeeze().numpy().astype(np.uint8)
+        return mask
+        
+    def _find_contours(self, mask):
+        """Поиск контуров объектов"""
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+        return contours
+        
+    def _analyze_contours(self, contours, frame_shape):
+        """Анализ найденных контуров"""
+        objects = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < self.min_object_size:
+                continue
+                
+            rect = cv2.minAreaRect(contour)
+            box = cv2.boxPoints(rect)
+            box = np.int0(box)
+            
+            center = np.mean(box, axis=0)
+            size = rect[1]
+            angle = rect[2]
+            
+            objects.append({
+                'center': center,
+                'size': size,
+                'angle': angle,
+                'contour': contour,
+                'area': area
+            })
+            
+        return objects
+
+
+class PoseEstimator:
+    def __init__(self):
+        self.model = PoseNet()
+        self.camera_matrix = self._get_camera_matrix()
+        
+    def estimate(self, frame, detections):
+        poses = []
+        for detection in detections:
+            # Извлечение ROI
+            roi = self._extract_roi(frame, detection)
+            
+            # Оценка позы
+            pose = self._estimate_single_pose(roi)
+            
+            # Преобразование в глобальные координаты
+            global_pose = self._to_global_coords(pose, detection)
+            
+            poses.append(global_pose)
+            
+        return poses
+        
+    def _extract_roi(self, frame, detection):
+        """Извлечение области интереса"""
+        center = detection['center']
+        size = detection['size']
+        angle = detection['angle']
+        
+        # Создание матрицы поворота
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        
+        # Извлечение и выравнивание ROI
+        roi_size = (int(size[0]*1.2), int(size[1]*1.2))
+        roi = cv2.getRectSubPix(frame, roi_size, center)
+        roi = cv2.warpAffine(roi, M, roi_size)
+        
+        return roi
+        
+    def _estimate_single_pose(self, roi):
+        """Оценка позы для одного объекта"""
+        # Предобработка ROI
+        roi_tensor = self._preprocess_roi(roi)
+        
+        # Получение предсказания от сети
+        with torch.no_grad():
+            pose_pred = self.model(roi_tensor)
+            
+        # Преобразование предсказания в матрицу трансформации
+        R = self._rotation_vector_to_matrix(pose_pred[:3])
+        t = pose_pred[3:6]
+        
+        return {'R': R, 't': t}
+class TrajectoryTracker:
+    def __init__(self):
+        self.tracks = {}
+        self.next_id = 0
+        self.max_lost = 30  # Максимальное количество кадров для трекинга
+        self.min_distance = 50  # Минимальная дистанция для ассоциации
+        
+        # Фильтры Калмана для каждого трека
+        self.kalman_filters = {}
+        
+    def update(self, poses):
+        # Предсказание новых положений для существующих треков
+        predicted_poses = self._predict_poses()
+        
+        # Ассоциация новых детекций с существующими треками
+        assignments = self._associate_detections(poses, predicted_poses)
+        
+        # Обновление треков
+        self._update_tracks(poses, assignments)
+        
+        # Создание новых треков
+        self._create_new_tracks(poses, assignments)
+        
+        # Удаление потерянных треков
+        self._remove_lost_tracks()
+        
+        return self.tracks
+        
+    def _predict_poses(self):
+        """Предсказание положений объектов"""
+        predictions = {}
+        for track_id, track in self.tracks.items():
+            if track_id in self.kalman_filters:
+                kf = self.kalman_filters[track_id]
+                prediction = kf.predict()
+                predictions[track_id] = prediction
+        return predictions
+        
+    def _associate_detections(self, poses, predicted_poses):
+        """Ассоциация детекций с существующими треками"""
+        if not poses or not predicted_poses:
+            return {}
+            
+        # Построение матрицы расстояний
+        cost_matrix = np.zeros((len(poses), len(predicted_poses)))
+        for i, pose in enumerate(poses):
+            for j, (track_id, pred_pose) in enumerate(predicted_poses.items()):
+                cost_matrix[i, j] = self._calculate_distance(pose, pred_pose)
+                
+        # Решение задачи назначения
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        
+        # Формирование ассоциаций
+        assignments = {}
+        for i, j in zip(row_ind, col_ind):
+            if cost_matrix[i, j] < self.min_distance:
+                track_id = list(predicted_poses.keys())[j]
+                assignments[track_id] = i
+                
+        return assignments
+        
+    def _update_tracks(self, poses, assignments):
+        """Обновление существующих треков"""
+        for track_id, detection_idx in assignments.items():
+            pose = poses[detection_idx]
+            
+            # Обновление трека
+            self.tracks[track_id].append(pose)
+            
+            # Обновление фильтра Калмана
+            if track_id in self.kalman_filters:
+                kf = self.kalman_filters[track_id]
+                measurement = self._pose_to_measurement(pose)
+                kf.update(measurement)
+                
+    def _create_new_tracks(self, poses, assignments):
+        """Создание новых треков для необработанных детекций"""
+        assigned_detections = set(assignments.values())
+        for i, pose in enumerate(poses):
+            if i not in assigned_detections:
+                # Создание нового трека
+                track_id = self.next_id
+                self.tracks[track_id] = [pose]
+                
+                # Инициализация фильтра Калмана
+                self.kalman_filters[track_id] = self._init_kalman_filter(pose)
+                
+                self.next_id += 1
+                
+    def _remove_lost_tracks(self):
+        """Удаление потерянных треков"""
+        current_time = time.time()
+        lost_tracks = []
+        
+        for track_id, track in self.tracks.items():
+            last_update = track[-1].get('timestamp', 0)
+            if current_time - last_update > self.max_lost:
+                lost_tracks.append(track_id)
+                
+        for track_id in lost_tracks:
+            del self.tracks[track_id]
+            if track_id in self.kalman_filters:
+                del self.kalman_filters[track_id]
+                
+    def _calculate_distance(self, pose1, pose2):
+        """Расчет расстояния между позами"""
+        pos1 = pose1['t']
+        pos2 = pose2['t']
+        return np.linalg.norm(pos1 - pos2)
+        
+    def _init_kalman_filter(self, pose):
+        """Инициализация фильтра Калмана для нового трека"""
+        kf = cv2.KalmanFilter(6, 3)  # 6 состояний (x,y,z + скорости), 3 измерения (x,y,z)
+        kf.measurementMatrix = np.array([[1,0,0,0,0,0],
+                                       [0,1,0,0,0,0],
+                                       [0,0,1,0,0,0]], np.float32)
+        kf.transitionMatrix = np.array([[1,0,0,1,0,0],
+                                      [0,1,0,0,1,0],
+                                      [0,0,1,0,0,1],
+                                      [0,0,0,1,0,0],
+                                      [0,0,0,0,1,0],
+                                      [0,0,0,0,0,1]], np.float32)
+                                      
+        # Инициализация состояния
+        init_state = self._pose_to_state(pose)
+        kf.statePost = init_state
+        
+        return kf
+        
+    def _pose_to_state(self, pose):
+        """Преобразование позы в вектор состояния"""
+        state = np.zeros((6, 1), np.float32)
+        state[:3] = pose['t'].reshape(3, 1)
+        return state
+        
+    def _pose_to_measurement(self, pose):
+        """Преобразование позы в вектор измерений"""
+        measurement = np.zeros((3, 1), np.float32)
+        measurement[:3] = pose['t'].reshape(3, 1)
+        return measurement
+class RobotController:
+    def __init__(self):
+        # Инициализация компонентов системы
+        self.vision_system = RobotVisionSystem()
+        self.vision_processor = VisionProcessor()
+        self.control_system = RobotControlSystem()
+        
+        # Параметры управления
+        self.control_rate = 100  # Гц
+        self.max_velocity = 1.0  # рад/с
+        self.max_acceleration = 2.0  # рад/с²
+        
+        # Буферы для данных
+        self.state_buffer = deque(maxlen=100)
+        self.action_buffer = deque(maxlen=100)
+        self.vision_buffer = deque(maxlen=5)
+        
+        # Флаги состояния
+        self.is_running = False
+        self.emergency_stop = False
+        
+    async def run(self):
+        """Основной цикл управления"""
+        self.is_running = True
+        last_time = time.time()
+        
+        while self.is_running and not self.emergency_stop:
+            current_time = time.time()
+            dt = current_time - last_time
+            
+            try:
+                # Получение и обработка данных с камеры
+                frame = await self.get_camera_frame()
+                if frame is not None:
+                    self.vision_buffer.append(frame)
+                    
+                    # Обработка изображения
+                    detections, poses, trajectories = self.vision_processor.process_frame(frame)
+                    
+                    # Обновление состояния системы
+                    state = self.update_system_state(detections, poses, trajectories)
+                    self.state_buffer.append(state)
+                    
+                    # Генерация управляющих воздействий
+                    actions = await self.generate_control_actions(state)
+                    self.action_buffer.append(actions)
+                    
+                    # Применение управляющих воздействий
+                    await self.apply_control_actions(actions, dt)
+                    
+                    # Обучение системы
+                    if len(self.state_buffer) >= self.control_system.batch_size:
+                        await self.train_system()
+                        
+            except Exception as e:
+                print(f"Error in control loop: {e}")
+                self.emergency_stop = True
+                
+            # Поддержание заданной частоты управления
+            sleep_time = 1.0/self.control_rate - (time.time() - current_time)
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+                
+            last_time = current_time
+            
+    async def update_system_state(self, detections, poses, trajectories):
+        """Обновление состояния системы"""
+        # Преобразование визуальных данных
+        visual_features = self.vision_system.encode_vision(
+            torch.stack([self.preprocess_image(frame) for frame in self.vision_buffer])
+        )
+        
+        # Получение состояния робота
+        robot_state = await self.get_robot_state()
+        
+        # Формирование полного состояния
+        full_state = {
+            'visual_features': visual_features,
+            'robot_state': robot_state,
+            'detections': detections,
+            'poses': poses,
+            'trajectories': trajectories,
+            'timestamp': time.time()
+        }
+        
+        return full_state
+        
+    async def generate_control_actions(self, state):
+        """Генерация управляющих воздействий"""
+        with torch.no_grad():
+            # Преобразование состояния в тензор
+            state_tensor = self.prepare_state_tensor(state)
+            
+            # Получение действий от нейронной сети
+            actions, value, _, _, _, _ = self.vision_system(state_tensor)
+            
+            # Масштабирование действий
+            scaled_actions = self.scale_actions(actions)
+            
+            # Проверка ограничений
+            safe_actions = self.check_safety_constraints(scaled_actions)
+            
+            return safe_actions
+            
+    def prepare_state_tensor(self, state):
+        """Подготовка тензора состояния"""
+        visual_features = state['visual_features']
+        robot_state = torch.FloatTensor(state['robot_state'])
+        
+        # Конкатенация признаков
+        combined_features = torch.cat([
+            visual_features.view(1, -1),
+            robot_state.view(1, -1)
+        ], dim=1)
+        
+        return combined_features
+        
+    def scale_actions(self, actions):
+        """Масштабирование действий"""
+        # Масштабирование углов суставов
+        joint_actions = actions[:, :6] * self.max_velocity
+        
+        # Масштабирование действия захвата
+        gripper_action = torch.sigmoid(actions[:, 6])
+        
+        return torch.cat([joint_actions, gripper_action.unsqueeze(1)], dim=1)
+        
+    def check_safety_constraints(self, actions):
+        """Проверка ограничений безопасности"""
+        # Проверка ограничений скорости
+        actions[:, :6] = torch.clamp(actions[:, :6], -self.max_velocity, self.max_velocity)
+        
+        # Проверка ускорений
+        if len(self.action_buffer) > 0:
+            last_action = self.action_buffer[-1]
+            dt = 1.0 / self.control_rate
+            acceleration = (actions - last_action) / dt
+            acceleration_limit = torch.ones_like(acceleration) * self.max_acceleration
+            
+            # Ограничение ускорений
+            scale = torch.min(
+                acceleration_limit / (torch.abs(acceleration) + 1e-6),
+                torch.ones_like(acceleration)
+            )
+            actions = last_action + scale * (actions - last_action)
+            
+        return actions
+class RobotController:  # продолжение класса
+    async def train_system(self):
+        """Обучение системы на собранных данных"""
+        # Подготовка обучающих данных
+        states, actions, rewards = self.prepare_training_data()
+        
+        # Обновление буфера опыта
+        self.update_experience_buffer(states, actions, rewards)
+        
+        # Обучение на мини-батче
+        metrics = self.control_system.train_step()
+        
+        if metrics:
+            await self.log_training_metrics(metrics)
+            
+    def prepare_training_data(self):
+        """Подготовка данных для обучения"""
+        states = []
+        actions = []
+        rewards = []
+        
+        # Извлечение последовательности состояний
+        for i in range(len(self.state_buffer) - 1):
+            state = self.state_buffer[i]
+            next_state = self.state_buffer[i + 1]
+            action = self.action_buffer[i]
+            
+            # Вычисление награды
+            reward = self.compute_reward(state, action, next_state)
+            
+            states.append(self.prepare_state_tensor(state))
+            actions.append(torch.FloatTensor(action))
+            rewards.append(reward)
+            
+        return torch.stack(states), torch.stack(actions), torch.tensor(rewards)
+        
+    def compute_reward(self, state, action, next_state):
+        """Вычисление функции награды"""
+        reward = 0.0
+        
+        # Награда за достижение цели
+        target_pos = self.get_target_position(state)
+        current_pos = self.get_end_effector_position(next_state)
+        distance_reward = -np.linalg.norm(target_pos - current_pos)
+        reward += 0.5 * distance_reward
+        
+        # Награда за плавность движений
+        smoothness_reward = -np.linalg.norm(action[:6])  # Только для суставов
+        reward += 0.3 * smoothness_reward
+        
+        # Награда за успешный захват
+        if self.is_grasp_successful(next_state):
+            reward += 10.0
+            
+        # Штраф за опасные конфигурации
+        if self.is_dangerous_configuration(next_state):
+            reward -= 20.0
+            
+        return reward
+        
+    async def apply_control_actions(self, actions, dt):
+        """Применение управляющих воздействий"""
+        try:
+            # Разделение действий на управление суставами и захватом
+            joint_actions = actions[:6].numpy()
+            gripper_action = actions[6].item()
+            
+            # Применение управления суставами
+            await self.set_joint_velocities(joint_actions)
+            
+            # Управление захватом
+            await self.control_gripper(gripper_action)
+            
+            # Проверка достижения целевого положения
+            if self.is_target_reached():
+                await self.complete_current_task()
+                
+        except Exception as e:
+            print(f"Error applying control actions: {e}")
+            await self.emergency_stop_routine()
+            
+    def is_target_reached(self):
+        """Проверка достижения целевой позиции"""
+        if len(self.state_buffer) < 2:
+            return False
+            
+        current_state = self.state_buffer[-1]
+        current_pos = self.get_end_effector_position(current_state)
+        target_pos = self.get_target_position(current_state)
+        
+        position_error = np.linalg.norm(current_pos - target_pos)
+        velocity_error = np.linalg.norm(self.action_buffer[-1][:6])
+        
+        return position_error < 0.01 and velocity_error < 0.05
+        
+    async def emergency_stop_routine(self):
+        """Процедура аварийной остановки"""
+        self.emergency_stop = True
+        
+        # Немедленная остановка всех движений
+        zero_velocities = np.zeros(6)
+        await self.set_joint_velocities(zero_velocities)
+        
+        # Открытие захвата
+        await self.control_gripper(0.0)
+        
+        # Логирование события
+        await self.log_emergency_event()
+        
+    def adaptive_control_parameters(self):
+        """Адаптивная настройка параметров управления"""
+        if len(self.state_buffer) < 10:
+            return
+            
+        # Анализ последних состояний
+        recent_states = list(self.state_buffer)[-10:]
+        recent_actions = list(self.action_buffer)[-10:]
+        
+        # Оценка производительности
+        tracking_error = self.compute_tracking_error(recent_states)
+        action_smoothness = self.compute_action_smoothness(recent_actions)
+        
+        # Адаптация параметров
+        self.adjust_control_gains(tracking_error)
+        self.adjust_safety_limits(action_smoothness)
+        
+    def compute_tracking_error(self, states):
+        """Вычисление ошибки слежения"""
+        errors = []
+        for state in states:
+            current_pos = self.get_end_effector_position(state)
+            target_pos = self.get_target_position(state)
+            error = np.linalg.norm(current_pos - target_pos)
+            errors.append(error)
+            
+        return np.mean(errors)
+        
+    def compute_action_smoothness(self, actions):
+        """Оценка плавности действий"""
+        if len(actions) < 2:
+            return 0.0
+            
+        action_diff = np.diff([action[:6].numpy() for action in actions], axis=0)
+        return np.mean(np.linalg.norm(action_diff, axis=1))
